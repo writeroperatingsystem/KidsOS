@@ -1,0 +1,89 @@
+# Builds the KidsOS ISO on GitHub's servers, then boots it in a virtual machine (1 GB RAM, BIOS and UEFI)
+# and saves screenshots. Put this file at  .github/workflows/build-iso.yml  next to kidsos-live.tar.gz
+name: Build and test KidsOS ISO
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the project
+        run: tar xzf kidsos-live.tar.gz
+
+      - name: Build the ISO inside Debian 13 (trixie)
+        run: |
+          docker run --rm --privileged -v "$PWD/kidsos-live:/build" -w /build debian:trixie bash -c \
+            "apt-get update && apt-get install -y live-build xorriso syslinux syslinux-common isolinux grub-pc-bin grub-efi-amd64-bin mtools dosfstools cpio zstd ca-certificates debian-archive-keyring && ./build.sh"
+
+      - name: Keep the build log (also when the build fails)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: kidsos-live/build.log
+          if-no-files-found: ignore
+
+      - name: Keep the ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: kidsos-iso
+          path: |
+            kidsos-live/kidsos-0.1-amd64.iso
+            kidsos-live/kidsos-0.1-amd64.iso.sha256
+          compression-level: 0
+
+  boot-test:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kidsos-iso
+
+      - name: Install QEMU and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf socat imagemagick xorriso
+          tar xzf kidsos-live.tar.gz
+
+      - name: Check the boot menu text inside the ISO
+        run: bash kidsos-live/tools/check-branding.sh kidsos-0.1-amd64.iso | tee branding-check.txt
+
+      - name: Boot in a virtual machine and take screenshots
+        run: |
+          ACCEL=tcg
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; ACCEL=kvm; fi
+          echo "accelerator: $ACCEL" | tee accel.txt
+          OVMF=$(ls /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF_CODE_4M.fd 2>/dev/null | head -1)
+          mkdir -p screens
+          for mode in bios uefi; do
+            EXTRA=""; [ "$mode" = uefi ] && EXTRA="-bios $OVMF"
+            qemu-system-x86_64 -accel $ACCEL -m 1024 -smp 1 $EXTRA -cdrom kidsos-0.1-amd64.iso -boot d \
+              -vga std -display none -monitor unix:/tmp/mon-$mode,server,nowait -serial file:screens/serial-$mode.txt &
+            QPID=$!
+            PREV=0
+            for T in 3 20 45 90 150 240 360; do
+              sleep $((T - PREV)); PREV=$T
+              echo "screendump /tmp/s.ppm" | socat - UNIX-CONNECT:/tmp/mon-$mode > /dev/null || true
+              sleep 1
+              [ -f /tmp/s.ppm ] && convert /tmp/s.ppm screens/$mode-${T}s.png && rm /tmp/s.ppm
+            done
+            kill $QPID 2>/dev/null || true
+            sleep 2
+          done
+          ls -la screens
+
+      - name: Keep the screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-screens
+          path: |
+            screens
+            branding-check.txt
+            accel.txt
